@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        run: brew install shellcheck
+      - name: ShellCheck
+        run: shellcheck bin/proxy-chain install.sh scripts/check-secrets.sh tests/smoke.sh
+      - name: Smoke test
+        run: bash tests/smoke.sh
+      - name: Check for secrets
+        run: bash scripts/check-secrets.sh

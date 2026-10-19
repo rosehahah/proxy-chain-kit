@@ -1,0 +1,418 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+APP_ID="com.xiaoxian.proxy-chain-kit"
+APP_NAME="Proxy Chain Kit"
+CONFIG_DIR="${HOME}/.config/proxy-chain-kit"
+SETTINGS_PLIST="${CONFIG_DIR}/settings.plist"
+RUNTIME_YAML="${CONFIG_DIR}/runtime.yaml"
+LAUNCH_AGENT="${HOME}/Library/LaunchAgents/${APP_ID}.plist"
+LOG_DIR="${HOME}/Library/Logs"
+CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
+CLAUDE_BACKUP="${HOME}/.claude/settings.json.proxy-chain-kit.backup"
+KEYCHAIN_USERNAME_SERVICE="${APP_ID}.residential.username"
+KEYCHAIN_PASSWORD_SERVICE="${APP_ID}.residential.password"
+
+info() { printf '→ %s\n' "$*"; }
+ok() { printf '✓ %s\n' "$*"; }
+warn() { printf '! %s\n' "$*" >&2; }
+die() { printf '错误：%s\n' "$*" >&2; exit 1; }
+
+require_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || die "当前版本仅支持 macOS。"
+}
+
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || die "缺少命令：$1"
+}
+
+prompt_value() {
+  local prompt="$1" default_value="$2" result
+  read -r -p "${prompt} [${default_value}]: " result
+  printf '%s' "${result:-$default_value}"
+}
+
+validate_port() {
+  local port="$1"
+  [[ "$port" =~ ^[0-9]+$ ]] || die "端口必须是数字：${port}"
+  (( port >= 1 && port <= 65535 )) || die "端口超出范围：${port}"
+}
+
+validate_simple_value() {
+  local label="$1" value="$2"
+  [[ -n "$value" ]] || die "${label}不能为空。"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "${label}不能包含换行。"
+}
+
+find_mihomo() {
+  local candidate
+  if command -v mihomo >/dev/null 2>&1; then
+    command -v mihomo
+    return
+  fi
+
+  for candidate in \
+    "/Applications/Clash Verge.app/Contents/MacOS/verge-mihomo" \
+    "/Applications/Clash Verge Rev.app/Contents/MacOS/verge-mihomo" \
+    "/opt/homebrew/bin/mihomo" \
+    "/usr/local/bin/mihomo"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  done
+
+  die "没有找到 Mihomo。请先安装 Clash Verge Rev，或执行 brew install mihomo。"
+}
+
+plist_get() {
+  /usr/bin/plutil -extract "$1" raw -o - "$SETTINGS_PLIST"
+}
+
+plist_put() {
+  local file="$1" key="$2" type="$3" value="$4"
+  if /usr/bin/plutil -type "$key" "$file" >/dev/null 2>&1; then
+    /usr/bin/plutil -replace "$key" "-$type" "$value" "$file"
+  else
+    /usr/bin/plutil -insert "$key" "-$type" "$value" "$file"
+  fi
+}
+
+yaml_quote() {
+  local value="$1"
+  validate_simple_value "配置值" "$value"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\&apos;/g"
+}
+
+stop_service() {
+  launchctl bootout "gui/$(id -u)/${APP_ID}" >/dev/null 2>&1 || true
+}
+
+write_settings() {
+  local upstream_type="$1" upstream_host="$2" upstream_port="$3"
+  local residential_host="$4" residential_port="$5" local_port="$6" mihomo_path="$7"
+  local tmp
+
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  tmp="$(mktemp "${CONFIG_DIR}/settings.XXXXXX")"
+  /usr/bin/plutil -create xml1 "$tmp"
+  plist_put "$tmp" UpstreamType string "$upstream_type"
+  plist_put "$tmp" UpstreamHost string "$upstream_host"
+  plist_put "$tmp" UpstreamPort integer "$upstream_port"
+  plist_put "$tmp" ResidentialHost string "$residential_host"
+  plist_put "$tmp" ResidentialPort integer "$residential_port"
+  plist_put "$tmp" LocalPort integer "$local_port"
+  plist_put "$tmp" MihomoPath string "$mihomo_path"
+  mv "$tmp" "$SETTINGS_PLIST"
+  chmod 600 "$SETTINGS_PLIST"
+}
+
+save_credentials() {
+  local username="$1" password="$2" account
+  account="$(id -un)"
+  security add-generic-password -U -a "$account" -s "$KEYCHAIN_USERNAME_SERVICE" -w "$username" >/dev/null
+  security add-generic-password -U -a "$account" -s "$KEYCHAIN_PASSWORD_SERVICE" -w "$password" >/dev/null
+}
+
+read_credential() {
+  security find-generic-password -a "$(id -un)" -s "$1" -w 2>/dev/null
+}
+
+configure_claude() {
+  local local_port="$1" proxy_url="http://127.0.0.1:${1}"
+
+  mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+  if [[ ! -f "$CLAUDE_SETTINGS" ]]; then
+    printf '{}\n' > "$CLAUDE_SETTINGS"
+  elif [[ ! -f "$CLAUDE_BACKUP" ]]; then
+    cp -p "$CLAUDE_SETTINGS" "$CLAUDE_BACKUP"
+  fi
+
+  /usr/bin/plutil -lint "$CLAUDE_SETTINGS" >/dev/null || die "${CLAUDE_SETTINGS} 不是有效的 JSON。"
+  if ! /usr/bin/plutil -type env "$CLAUDE_SETTINGS" >/dev/null 2>&1; then
+    /usr/bin/plutil -insert env -dictionary "$CLAUDE_SETTINGS"
+  elif [[ "$(/usr/bin/plutil -type env "$CLAUDE_SETTINGS")" != "dictionary" ]]; then
+    die "Claude settings.json 中的 env 不是对象，请先手动修复。"
+  fi
+
+  plist_put "$CLAUDE_SETTINGS" env.HTTP_PROXY string "$proxy_url"
+  plist_put "$CLAUDE_SETTINGS" env.HTTPS_PROXY string "$proxy_url"
+  plist_put "$CLAUDE_SETTINGS" env.ALL_PROXY string "$proxy_url"
+  /usr/bin/plutil -convert json -r "$CLAUDE_SETTINGS"
+  chmod 600 "$CLAUDE_SETTINGS"
+}
+
+install_launch_agent() {
+  local installed_bin="$1" bin_xml log_xml err_xml
+  mkdir -p "$(dirname "$LAUNCH_AGENT")" "$LOG_DIR"
+  bin_xml="$(xml_escape "$installed_bin")"
+  log_xml="$(xml_escape "${LOG_DIR}/proxy-chain-kit.log")"
+  err_xml="$(xml_escape "${LOG_DIR}/proxy-chain-kit-error.log")"
+
+  umask 022
+  cat > "$LAUNCH_AGENT" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${APP_ID}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${bin_xml}</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>${log_xml}</string>
+  <key>StandardErrorPath</key>
+  <string>${err_xml}</string>
+</dict>
+</plist>
+EOF
+
+  /usr/bin/plutil -lint "$LAUNCH_AGENT" >/dev/null
+  stop_service
+  launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT"
+  launchctl kickstart -k "gui/$(id -u)/${APP_ID}"
+}
+
+run_proxy() {
+  require_macos
+  [[ -f "$SETTINGS_PLIST" ]] || die "尚未初始化，请先执行 proxy-chain init。"
+
+  local upstream_type upstream_host upstream_port residential_host residential_port local_port mihomo_path
+  local username password
+  upstream_type="$(plist_get UpstreamType)"
+  upstream_host="$(plist_get UpstreamHost)"
+  upstream_port="$(plist_get UpstreamPort)"
+  residential_host="$(plist_get ResidentialHost)"
+  residential_port="$(plist_get ResidentialPort)"
+  local_port="$(plist_get LocalPort)"
+  mihomo_path="$(plist_get MihomoPath)"
+  username="$(read_credential "$KEYCHAIN_USERNAME_SERVICE")" || die "无法从钥匙串读取住宅代理用户名。"
+  password="$(read_credential "$KEYCHAIN_PASSWORD_SERVICE")" || die "无法从钥匙串读取住宅代理密码。"
+  [[ -x "$mihomo_path" ]] || die "Mihomo 不存在：${mihomo_path}"
+
+  umask 077
+  cat > "$RUNTIME_YAML" <<EOF
+mixed-port: ${local_port}
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: rule
+log-level: warning
+
+proxies:
+  - name: "Base-Upstream"
+    type: ${upstream_type}
+    server: $(yaml_quote "$upstream_host")
+    port: ${upstream_port}
+
+  - name: "Residential-Exit"
+    type: socks5
+    server: $(yaml_quote "$residential_host")
+    port: ${residential_port}
+    username: $(yaml_quote "$username")
+    password: $(yaml_quote "$password")
+    dialer-proxy: "Base-Upstream"
+
+proxy-groups:
+  - name: "Claude-Residential"
+    type: select
+    proxies:
+      - "Residential-Exit"
+
+rules:
+  - MATCH,Claude-Residential
+EOF
+
+  chmod 600 "$RUNTIME_YAML"
+  unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+  exec "$mihomo_path" -d "$CONFIG_DIR" -f "$RUNTIME_YAML"
+}
+
+init_config() {
+  require_macos
+  require_command security
+  require_command curl
+
+  local upstream_type upstream_host upstream_port residential_host residential_port
+  local residential_username residential_password local_port mihomo_path installed_bin
+
+  printf '\n%s 初始化\n\n' "$APP_NAME"
+  upstream_type="$(prompt_value "基础代理协议（http 或 socks5）" "http")"
+  [[ "$upstream_type" == "http" || "$upstream_type" == "socks5" ]] || die "基础代理协议只能是 http 或 socks5。"
+  upstream_host="$(prompt_value "基础代理地址" "127.0.0.1")"
+  upstream_port="$(prompt_value "基础代理端口" "7890")"
+  residential_host="$(prompt_value "Webshare Proxy Address" "")"
+  residential_port="$(prompt_value "Webshare Port" "")"
+  read -r -p "Webshare Username: " residential_username
+  read -r -s -p "Webshare Password: " residential_password
+  printf '\n'
+  local_port="$(prompt_value "Claude Code 专用本地端口" "7895")"
+
+  validate_simple_value "基础代理地址" "$upstream_host"
+  validate_simple_value "住宅代理地址" "$residential_host"
+  validate_simple_value "住宅代理用户名" "$residential_username"
+  validate_simple_value "住宅代理密码" "$residential_password"
+  validate_port "$upstream_port"
+  validate_port "$residential_port"
+  validate_port "$local_port"
+
+  mihomo_path="$(find_mihomo)"
+  installed_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  stop_service
+  if lsof -nP -iTCP:"$local_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    die "端口 ${local_port} 已被其他程序占用，请换一个端口。"
+  fi
+
+  info "保存非敏感配置"
+  write_settings "$upstream_type" "$upstream_host" "$upstream_port" \
+    "$residential_host" "$residential_port" "$local_port" "$mihomo_path"
+  info "将代理凭据保存到 macOS 钥匙串"
+  save_credentials "$residential_username" "$residential_password"
+  info "配置 Claude Code 专用代理"
+  configure_claude "$local_port"
+  info "安装后台服务"
+  install_launch_agent "$installed_bin"
+
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    if lsof -nP -iTCP:"$local_port" -sTCP:LISTEN >/dev/null 2>&1; then
+      ok "安装完成，Claude Code 专用端口为 ${local_port}。"
+      printf '\n'
+      test_routes
+      return
+    fi
+    sleep 1
+  done
+
+  warn "后台服务没有成功监听端口，请执行 proxy-chain status 查看状态。"
+  exit 1
+}
+
+test_routes() {
+  require_macos
+  require_command curl
+  [[ -f "$SETTINGS_PLIST" ]] || die "尚未初始化，请先执行 proxy-chain init。"
+
+  local upstream_type upstream_host upstream_port local_port ordinary_ip residential_json
+  local residential_ip city region country
+  upstream_type="$(plist_get UpstreamType)"
+  upstream_host="$(plist_get UpstreamHost)"
+  upstream_port="$(plist_get UpstreamPort)"
+  local_port="$(plist_get LocalPort)"
+
+  info "检查基础代理出口"
+  if [[ "$upstream_type" == "socks5" ]]; then
+    ordinary_ip="$(curl --noproxy '' -fsS --max-time 15 --socks5-hostname "${upstream_host}:${upstream_port}" https://api.ipify.org)" \
+      || die "基础代理连接失败，请确认基础代理已经启动。"
+  else
+    ordinary_ip="$(curl --noproxy '' -fsS --max-time 15 -x "http://${upstream_host}:${upstream_port}" https://api.ipify.org)" \
+      || die "基础代理连接失败，请确认基础代理已经启动。"
+  fi
+
+  info "检查住宅代理出口"
+  residential_json="$(curl --noproxy '' -fsS --max-time 25 -x "http://127.0.0.1:${local_port}" https://ipinfo.io/json)" \
+    || die "住宅代理连接失败，请检查 Webshare 信息并运行 proxy-chain status。"
+
+  residential_ip="$(printf '%s' "$residential_json" | /usr/bin/plutil -extract ip raw -o - - 2>/dev/null || printf '未知')"
+  city="$(printf '%s' "$residential_json" | /usr/bin/plutil -extract city raw -o - - 2>/dev/null || printf '未知')"
+  region="$(printf '%s' "$residential_json" | /usr/bin/plutil -extract region raw -o - - 2>/dev/null || printf '未知')"
+  country="$(printf '%s' "$residential_json" | /usr/bin/plutil -extract country raw -o - - 2>/dev/null || printf '未知')"
+
+  printf '\n基础代理出口：%s\n' "$ordinary_ip"
+  printf 'Claude Code 出口：%s\n' "$residential_ip"
+  printf '住宅 IP 位置：%s, %s, %s\n\n' "$city" "$region" "$country"
+  ok "双层代理工作正常。"
+}
+
+show_status() {
+  require_macos
+  if [[ ! -f "$SETTINGS_PLIST" ]]; then
+    printf '状态：尚未初始化\n'
+    return
+  fi
+
+  local local_port state
+  local_port="$(plist_get LocalPort)"
+  state="$(launchctl print "gui/$(id -u)/${APP_ID}" 2>/dev/null | awk -F'= ' '/state =/{print $2; exit}' || true)"
+  printf '后台服务：%s\n' "${state:-未运行}"
+  if lsof -nP -iTCP:"$local_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    printf '专用端口：127.0.0.1:%s（监听中）\n' "$local_port"
+  else
+    printf '专用端口：127.0.0.1:%s（未监听）\n' "$local_port"
+  fi
+  printf '配置目录：%s\n' "$CONFIG_DIR"
+  printf '日志文件：%s\n' "${LOG_DIR}/proxy-chain-kit-error.log"
+}
+
+remove_claude_proxy_if_owned() {
+  [[ -f "$CLAUDE_SETTINGS" && -f "$SETTINGS_PLIST" ]] || return
+  local local_port expected key current
+  local_port="$(plist_get LocalPort)"
+  expected="http://127.0.0.1:${local_port}"
+  for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY; do
+    current="$(/usr/bin/plutil -extract "env.${key}" raw -o - "$CLAUDE_SETTINGS" 2>/dev/null || true)"
+    if [[ "$current" == "$expected" ]]; then
+      /usr/bin/plutil -remove "env.${key}" "$CLAUDE_SETTINGS"
+    fi
+  done
+  /usr/bin/plutil -convert json -r "$CLAUDE_SETTINGS"
+}
+
+uninstall_config() {
+  require_macos
+  remove_claude_proxy_if_owned
+  stop_service
+  security delete-generic-password -a "$(id -un)" -s "$KEYCHAIN_USERNAME_SERVICE" >/dev/null 2>&1 || true
+  security delete-generic-password -a "$(id -un)" -s "$KEYCHAIN_PASSWORD_SERVICE" >/dev/null 2>&1 || true
+  rm -f "$LAUNCH_AGENT" "$RUNTIME_YAML" "$SETTINGS_PLIST"
+  rmdir "$CONFIG_DIR" >/dev/null 2>&1 || true
+  ok "后台服务、运行配置和钥匙串凭据已经移除。"
+  printf '命令行文件仍保留，可手动删除：%s\n' "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+}
+
+show_help() {
+  cat <<'EOF'
+Proxy Chain Kit
+
+用法：
+  proxy-chain init       交互式配置基础代理与 Webshare
+  proxy-chain test       检查普通出口和住宅出口
+  proxy-chain status     查看后台服务状态
+  proxy-chain uninstall  移除服务、配置与钥匙串凭据
+  proxy-chain help       显示帮助
+EOF
+}
+
+case "${1:-help}" in
+  init) init_config ;;
+  run) run_proxy ;;
+  test) test_routes ;;
+  status) show_status ;;
+  uninstall) uninstall_config ;;
+  help|-h|--help) show_help ;;
+  *) show_help; exit 1 ;;
+esac

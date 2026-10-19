@@ -1,0 +1,9 @@
+.DS_Store
+.env
+.env.*
+*.log
+*.backup
+runtime.yaml
+settings.plist
+config.yaml
+coverage/
