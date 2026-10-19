@@ -292,17 +292,18 @@ init_config() {
     "$residential_host" "$residential_port" "$local_port" "$mihomo_path"
   info "将代理凭据保存到 macOS 钥匙串"
   save_credentials "$residential_username" "$residential_password"
-  info "配置 Claude Code 专用代理"
-  configure_claude "$local_port"
   info "安装后台服务"
   install_launch_agent "$installed_bin"
 
   local attempt
   for (( attempt = 1; attempt <= 8; attempt++ )); do
     if lsof -nP -iTCP:"$local_port" -sTCP:LISTEN >/dev/null 2>&1; then
-      ok "安装完成，Claude Code 专用端口为 ${local_port}。"
+      ok "代理服务已经启动，Claude Code 专用端口为 ${local_port}。"
       printf '\n'
       test_routes
+      info "测试通过，开始配置 Claude Code 专用代理"
+      configure_claude "$local_port"
+      ok "安装完成。下次启动 Claude Code 时会自动使用住宅代理。"
       return
     fi
     sleep 1

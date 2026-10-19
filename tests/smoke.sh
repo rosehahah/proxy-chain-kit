@@ -13,8 +13,10 @@ grep -q 'proxy-chain init' <<< "$help_output"
 grep -q 'proxy-chain test' <<< "$help_output"
 grep -q 'proxy-chain uninstall' <<< "$help_output"
 
-grep -q '## 第一步' "$ROOT_DIR/README.md"
-grep -q '## 第二步' "$ROOT_DIR/README.md"
-grep -q '## 第三步' "$ROOT_DIR/README.md"
+grep -q '## 安装方式一：直接交给 Agent' "$ROOT_DIR/README.md"
+grep -q '## 安装方式二：自己操作' "$ROOT_DIR/README.md"
+grep -q '### 第一步' "$ROOT_DIR/README.md"
+grep -q '### 第二步' "$ROOT_DIR/README.md"
+grep -q '### 第三步' "$ROOT_DIR/README.md"
 
 printf 'Smoke tests passed.\n'

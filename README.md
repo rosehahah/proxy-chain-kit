@@ -4,7 +4,32 @@
 
 普通上网继续走原来的基础代理，只有 Claude Code 走 Webshare，不会让浏览器、ChatGPT、视频和下载消耗住宅代理流量。
 
-## 第一步：准备好两样东西
+## 安装方式一：直接交给 Agent
+
+把下面这段提示词完整复制给 Codex、Claude Code，或者其他能够操作终端的 Agent：
+
+```text
+请帮我在 macOS 上安装并配置 Proxy Chain Kit。
+
+项目地址：https://github.com/rosehahah/proxy-chain-kit
+
+我的目标是：普通上网继续走现有的 iKuuu、Clash 或其他基础代理；只有 Claude Code 通过“基础代理 → Webshare 固定住宅代理”访问网络。
+
+请按下面要求执行：
+1. 先检查当前基础代理是否正常，并确认它的本地地址和端口；不要关闭或替换我现有的基础代理。
+2. 克隆并阅读项目，运行安装程序。检查电脑上是否已有 Mihomo 或 Clash Verge Rev，没有时再告诉我如何安装。
+3. 配置前备份 ~/.claude/settings.json。先在独立本地端口测试代理链，测试成功后再让 Claude Code 使用它。
+4. Webshare 的 Proxy Address、Port、Username 和 Password 如果已经保存在我的本机文件中，可以读取后配置，但绝对不要在聊天、日志、截图或 Git 提交中回显；如果找不到，就停下来让我在终端里自己输入。
+5. 普通流量和 ChatGPT 不能走 Webshare。不要打开或启动 Claude Code，只完成网络配置和测试。
+6. 完成后运行 proxy-chain test，告诉我基础代理出口、住宅代理出口、住宅 IP 所在城市，以及后台服务是否正常。汇报时不要显示用户名、密码或订阅地址。
+7. 如果测试失败，不要破坏当前网络；保留备份并说明失败原因。
+```
+
+Agent 完成后，只需要确认测试结果。整个过程中不要把 Webshare 密码直接发到公开聊天或 Issue。
+
+## 安装方式二：自己操作
+
+### 第一步：准备好两样东西
 
 1. 打开 iKuuu、Clash 或其他基础代理，确认本地代理端口可用，通常是 `127.0.0.1:7890`。
 2. 在 Webshare 后台找到一个固定住宅代理，准备好 `Proxy Address`、`Port`、`Username` 和 `Password`。
@@ -15,7 +40,7 @@
 brew install mihomo
 ```
 
-## 第二步：安装并填写代理信息
+### 第二步：安装并填写代理信息
 
 ```bash
 git clone https://github.com/rosehahah/proxy-chain-kit.git
@@ -26,7 +51,7 @@ cd proxy-chain-kit
 
 按照终端提示填写基础代理和 Webshare 信息。密码会保存到 macOS 钥匙串，不会写进项目仓库。
 
-## 第三步：检查后直接使用 Claude Code
+### 第三步：检查后直接使用 Claude Code
 
 ```bash
 ~/.local/bin/proxy-chain test
